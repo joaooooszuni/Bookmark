@@ -1,23 +1,53 @@
 /**
- * Cloudflare Pages Function — /api/auth/discord/callback
- * Troca o authorization code pelo token de acesso do Discord, obtém o perfil (@me)
- * e persiste no Cloudflare D1 com cookie de sessão.
+ * Cloudflare Pages Function — GET /api/auth/discord/callback
+ * 1. Confere o "state" (anti-CSRF).
+ * 2. Troca o authorization code pelo token do Discord.
+ * 3. Busca o perfil (@me) e grava/atualiza o usuário no D1.
+ * 4. Cria o cookie de sessão ASSINADO (HMAC) e redireciona para a home.
  */
+import {
+  createSessionValue,
+  buildSessionCookie,
+  buildClearCookie,
+} from "../../../_lib/session.js";
+
+function readCookie(request, name) {
+  const cookie = request.headers.get("Cookie") || "";
+  const match = cookie.match(new RegExp("(?:^|;\\s*)" + name + "=([^;]+)"));
+  return match ? match[1] : null;
+}
+
 export async function onRequestGet(context) {
   const { request, env } = context;
   const url = new URL(request.url);
-  const code = url.searchParams.get("code");
-  const error = url.searchParams.get("error");
 
-  if (error || !code) {
-    return Response.redirect(new URL("/?auth_error=" + encodeURIComponent(error || "missing_code"), url.origin).href, 302);
+  // Redireciona sempre apagando o cookie do state, que só vale para uma tentativa.
+  function redirectTo(path, extraCookie) {
+    const headers = new Headers({ Location: path });
+    headers.append("Set-Cookie", buildClearCookie("oauth_state"));
+    if (extraCookie) headers.append("Set-Cookie", extraCookie);
+    return new Response(null, { status: 302, headers });
   }
 
-  if (!env.DISCORD_CLIENT_ID || !env.DISCORD_CLIENT_SECRET) {
+  const code = url.searchParams.get("code");
+  const error = url.searchParams.get("error");
+  const stateParam = url.searchParams.get("state");
+  const stateCookie = readCookie(request, "oauth_state");
+
+  if (error || !code) {
+    return redirectTo("/?auth_error=" + encodeURIComponent(error || "missing_code"));
+  }
+
+  // Proteção CSRF: o state da URL precisa ser igual ao do cookie.
+  if (!stateParam || !stateCookie || stateParam !== stateCookie) {
+    return redirectTo("/?auth_error=invalid_state");
+  }
+
+  if (!env.DISCORD_CLIENT_ID || !env.DISCORD_CLIENT_SECRET || !env.SESSION_SECRET) {
     return Response.json({
       ok: false,
       error: "missing_credentials",
-      message: "Defina DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET nas variáveis do Cloudflare Pages (Settings -> Environment variables).",
+      message: "Defina DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET e SESSION_SECRET nas variáveis do Cloudflare Pages (.dev.vars no ambiente local).",
     }, { status: 500 });
   }
 
@@ -37,7 +67,7 @@ export async function onRequestGet(context) {
     });
 
     if (!tokenRes.ok) {
-      return Response.redirect(new URL("/?auth_error=token_exchange_failed", url.origin).href, 302);
+      return redirectTo("/?auth_error=token_exchange_failed");
     }
 
     const tokenData = await tokenRes.json();
@@ -46,7 +76,7 @@ export async function onRequestGet(context) {
     });
 
     if (!userRes.ok) {
-      return Response.redirect(new URL("/?auth_error=fetch_user_failed", url.origin).href, 302);
+      return redirectTo("/?auth_error=fetch_user_failed");
     }
 
     const discordUser = await userRes.json();
@@ -56,28 +86,21 @@ export async function onRequestGet(context) {
       ? `https://cdn.discordapp.com/avatars/${userId}/${discordUser.avatar}.png`
       : "https://cdn.discordapp.com/embed/avatars/0.png";
 
-    if (env.DB) {
-      try {
-        await env.DB.prepare(
-          "CREATE TABLE IF NOT EXISTS discord_users (user_id TEXT PRIMARY KEY, username TEXT NOT NULL, avatar TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-        ).run();
-        await env.DB.prepare(
-          "INSERT INTO discord_users (user_id, username, avatar, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, avatar = excluded.avatar, updated_at = CURRENT_TIMESTAMP"
-        ).bind(userId, username, avatar).run();
-      } catch {}
+    // A tabela discord_users vem da migration 0001; não é mais criada aqui.
+    try {
+      await env.DB.prepare(
+        "INSERT INTO discord_users (user_id, username, avatar, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) " +
+        "ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, avatar = excluded.avatar, updated_at = CURRENT_TIMESTAMP"
+      ).bind(userId, username, avatar).run();
+    } catch (dbErr) {
+      console.error("Falha ao gravar usuário no D1:", dbErr);
+      return redirectTo("/?auth_error=db_error");
     }
 
-    const sessionPayload = JSON.stringify({ userId, username, avatar });
-    const encodedSession = btoa(encodeURIComponent(sessionPayload));
-
-    return new Response(null, {
-      status: 302,
-      headers: {
-        Location: "/?login=success",
-        "Set-Cookie": `discord_session=${encodedSession}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400; Secure`,
-      },
-    });
+    const sessionValue = await createSessionValue({ userId, username, avatar }, env.SESSION_SECRET);
+    return redirectTo("/?login=success", buildSessionCookie(sessionValue));
   } catch (err) {
-    return Response.redirect(new URL("/?auth_error=exception", url.origin).href, 302);
+    console.error("Erro no callback OAuth:", err);
+    return redirectTo("/?auth_error=exception");
   }
 }

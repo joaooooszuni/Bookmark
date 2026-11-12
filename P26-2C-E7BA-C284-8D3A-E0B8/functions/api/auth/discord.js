@@ -1,6 +1,10 @@
 /**
- * Cloudflare Pages Function — /api/auth/discord
- * Endpoint de autenticação OAuth2 do Discord (importa user_id, username e avatar).
+ * Cloudflare Pages Function — GET /api/auth/discord
+ * Inicia o login OAuth2 do Discord.
+ *
+ * Gera um "state" aleatório, guarda num cookie de curta duração e o envia
+ * na URL de autorização. O callback confere se os dois são iguais, o que
+ * impede que um atacante faça a vítima concluir um login iniciado por ele (CSRF).
  */
 export async function onRequestGet(context) {
   const { request, env } = context;
@@ -9,9 +13,13 @@ export async function onRequestGet(context) {
   if (!env.DISCORD_CLIENT_ID) {
     return Response.json({
       configured: false,
-      message: "Defina DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET nas variáveis do Cloudflare Pages para login real, ou utilize o perfil de sessão local durante o diagnóstico.",
-    });
+      message: "Defina DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET nas variáveis do Cloudflare Pages para o login funcionar.",
+    }, { status: 500 });
   }
+
+  // 16 bytes aleatórios -> 32 caracteres hexadecimais
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const state = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 
   const redirectUri = new URL("/api/auth/discord/callback", url.origin).href;
   const authorizeUrl = new URL("https://discord.com/api/oauth2/authorize");
@@ -19,6 +27,14 @@ export async function onRequestGet(context) {
   authorizeUrl.searchParams.set("redirect_uri", redirectUri);
   authorizeUrl.searchParams.set("response_type", "code");
   authorizeUrl.searchParams.set("scope", "identify");
+  authorizeUrl.searchParams.set("state", state);
 
-  return Response.redirect(authorizeUrl.href, 302);
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: authorizeUrl.href,
+      // 10 minutos é tempo de sobra para o usuário autorizar no Discord
+      "Set-Cookie": `oauth_state=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`,
+    },
+  });
 }
